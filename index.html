@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Esfera Saltitante — VR/AR com Babylon.js</title>
+<style>
+  html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #0b0e14;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  #renderCanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+  }
+
+  #infoOverlay {
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    color: #e8ecf3;
+    background: rgba(15, 18, 28, 0.65);
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.5;
+    backdrop-filter: blur(6px);
+    pointer-events: none;
+    max-width: 260px;
+  }
+
+  #infoOverlay strong {
+    color: #7ad0ff;
+  }
+
+  #xrStatus {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    color: #e8ecf3;
+    background: rgba(15, 18, 28, 0.65);
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 12px;
+    backdrop-filter: blur(6px);
+  }
+
+  #xrStatus .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ff5c5c;
+    margin-right: 6px;
+  }
+
+  #xrStatus.connected .dot {
+    background: #4cd964;
+  }
+
+  #fallbackMsg {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #ffcf7a;
+    background: rgba(15, 18, 28, 0.75);
+    padding: 8px 16px;
+    border-radius: 10px;
+    font-size: 12px;
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="renderCanvas"></canvas>
+
+<div id="infoOverlay">
+  <strong>Esfera Saltitante</strong><br/>
+  Desktop: arraste para orbitar a câmera.<br/>
+  VR: aponte e clique na esfera para trocar a cor.<br/>
+  AR: toque no chão real para reposicionar o salto.
+</div>
+
+<div id="xrStatus">
+  <span class="dot"></span><span id="xrStatusText">XR desconectado</span>
+</div>
+
+<div id="fallbackMsg">Este dispositivo/navegador não parece suportar WebXR. A cena roda normalmente em modo desktop.</div>
+
+<!-- Babylon.js core, loaders e GUI via CDN -->
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+<script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+
+<script>
+  // ==========================================================
+  // Aplicação: Esfera Saltitante em VR/AR com Babylon.js
+  // ==========================================================
+  // Estrutura geral:
+  //   criarEngineECena()      -> inicializa engine, scene, câmera, luzes
+  //   criarChao()              -> cria o plano de referência com grid
+  //   criarEsferaSaltitante()  -> cria a esfera e a lógica de animação (quique)
+  //   configurarSombras()      -> shadow generator para a esfera
+  //   configurarXR()           -> configura WebXR (VR + AR com hit-test)
+  //   configurarInterface()    -> GUI simples (status XR)
+  //   configurarInteratividade() -> troca de cor ao clicar/apontar na esfera
+  // ==========================================================
+
+  const canvas = document.getElementById("renderCanvas");
+  const xrStatusEl = document.getElementById("xrStatus");
+  const xrStatusText = document.getElementById("xrStatusText");
+  const fallbackMsg = document.getElementById("fallbackMsg");
+
+  // ----------------------------------------------------------
+  // 1. Engine e cena base
+  // ----------------------------------------------------------
+  function criarEngineECena() {
+    const engine = new BABYLON.Engine(canvas, true, { stencil: true });
+    const scene = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0.04, 0.05, 0.08, 1);
+
+    // Câmera para visualização em desktop (orbital ao redor da esfera)
+    const camera = new BABYLON.ArcRotateCamera(
+      "camera",
+      -Math.PI / 2,
+      Math.PI / 2.6,
+      6,
+      new BABYLON.Vector3(0, 0.6, 0),
+      scene
+    );
+    camera.attachControl(canvas, true);
+    camera.lowerRadiusLimit = 2;
+    camera.upperRadiusLimit = 15;
+    camera.wheelDeltaPercentage = 0.01;
+
+    // Iluminação: hemisférica (ambiente) + direcional (para sombras)
+    const hemiLight = new BABYLON.HemisphericLight(
+      "hemiLight",
+      new BABYLON.Vector3(0, 1, 0),
+      scene
+    );
+    hemiLight.intensity = 0.55;
+
+    const dirLight = new BABYLON.DirectionalLight(
+      "dirLight",
+      new BABYLON.Vector3(-0.5, -1, -0.3),
+      scene
+    );
+    dirLight.position = new BABYLON.Vector3(4, 8, 4);
+    dirLight.intensity = 0.9;
+
+    return { engine, scene, camera, dirLight };
+  }
+
+  // ----------------------------------------------------------
+  // 2. Chão de referência
+  // ----------------------------------------------------------
+  function criarChao(scene) {
+    const chao = BABYLON.MeshBuilder.CreateGround(
+      "chao",
+      { width: 12, height: 12, subdivisions: 4 },
+      scene
+    );
+
+    const matChao = new BABYLON.StandardMaterial("matChao", scene);
+    matChao.diffuseColor = new BABYLON.Color3(0.12, 0.14, 0.2);
+    matChao.specularColor = new BABYLON.Color3(0.05, 0.05, 0.05);
+
+    // Grid procedural simples via GridMaterial (se disponível) ou textura básica
+    if (BABYLON.GridMaterial) {
+      const gridMat = new BABYLON.GridMaterial("gridMat", scene);
+      gridMat.majorUnitFrequency = 5;
+      gridMat.minorUnitVisibility = 0.35;
+      gridMat.gridRatio = 0.5;
+      gridMat.mainColor = new BABYLON.Color3(0.1, 0.12, 0.18);
+      gridMat.lineColor = new BABYLON.Color3(0.3, 0.55, 0.8);
+      gridMat.opacity = 0.98;
+      chao.material = gridMat;
+    } else {
+      chao.material = matChao;
+    }
+
+    chao.receiveShadows = true;
+    return chao;
+  }
+
+  // ----------------------------------------------------------
+  // 3. Esfera saltitante — física simplificada de quique com
+  //    perda de energia a cada impacto (amortecimento)
+  // ----------------------------------------------------------
+  function criarEsferaSaltitante(scene) {
+    const esfera = BABYLON.MeshBuilder.CreateSphere(
+      "esfera",
+      { diameter: 0.6, segments: 32 },
+      scene
+    );
+
+    const matEsfera = new BABYLON.StandardMaterial("matEsfera", scene);
+    matEsfera.diffuseColor = new BABYLON.Color3(0.25, 0.65, 1.0);
+    matEsfera.specularColor = new BABYLON.Color3(0.8, 0.8, 0.8);
+    matEsfera.specularPower = 32;
+    esfera.material = matEsfera;
+
+    // Ponto de origem do salto (pode ser realocado em AR via hit-test)
+    esfera.metadata = {
+      origem: new BABYLON.Vector3(0, 0.3, 0),
+      raio: 0.3
+    };
+    esfera.position = esfera.metadata.origem.clone();
+
+    // --- Lógica de física simplificada do quique ---
+    // Simula gravidade + coeficiente de restituição (perda de altura por salto)
+    const gravidade = -9.8;
+    const restituicao = 0.72; // fração de velocidade mantida após cada quique
+    let velocidadeY = 0;
+    let alturaMinimaSalto = 0.02; // abaixo disso, consideramos a esfera "parada"
+
+    // Reinicia o salto com energia máxima (chamado no início e ao reposicionar)
+    function reiniciarSalto() {
+      velocidadeY = 4.2;
+    }
+    reiniciarSalto();
+
+    scene.onBeforeRenderObservable.add(() => {
+      const dt = scene.getEngine().getDeltaTime() / 1000;
+      const origemY = esfera.metadata.origem.y;
+
+      velocidadeY += gravidade * dt;
+      esfera.position.y += velocidadeY * dt;
+
+      // Colisão com o "chão" relativo à origem do salto
+      if (esfera.position.y <= origemY) {
+        esfera.position.y = origemY;
+        velocidadeY = -velocidadeY * restituicao;
+
+        // Se o quique perdeu força suficiente, relança com energia total
+        // (mantém a animação contínua e visível, como pedido)
+        if (Math.abs(velocidadeY) < alturaMinimaSalto * 10) {
+          reiniciarSalto();
+        }
+      }
+
+      // Pequeno "squash and stretch" no eixo Y para dar sensação de impacto
+      const fatorEstico = BABYLON.Scalar.Clamp(
+        1 + velocidadeY * 0.015,
+        0.8,
+        1.2
+      );
+      esfera.scaling.y = fatorEstico;
+      esfera.scaling.x = esfera.scaling.z = 1 / Math.sqrt(fatorEstico);
+    });
+
+    esfera.metadata.reiniciarSalto = reiniciarSalto;
+    return esfera;
+  }
+
+  // ----------------------------------------------------------
+  // 4. Sombra projetada pela esfera
+  // ----------------------------------------------------------
+  function configurarSombras(dirLight, esfera) {
+    const shadowGen = new BABYLON.ShadowGenerator(1024, dirLight);
+    shadowGen.addShadowCaster(esfera);
+    shadowGen.useBlurExponentialShadowMap = true;
+    shadowGen.blurKernel = 32;
+    return shadowGen;
+  }
+
+  // ----------------------------------------------------------
+  // 5. Interatividade: clique/toque na esfera troca a cor
+  //    (funciona em desktop, VR via ray picking e AR via touch)
+  // ----------------------------------------------------------
+  function configurarInteratividade(scene, esfera) {
+    const cores = [
+      new BABYLON.Color3(0.25, 0.65, 1.0),
+      new BABYLON.Color3(1.0, 0.35, 0.4),
+      new BABYLON.Color3(0.4, 0.9, 0.45),
+      new BABYLON.Color3(1.0, 0.75, 0.2),
+      new BABYLON.Color3(0.75, 0.4, 1.0)
+    ];
+    let indiceCor = 0;
+
+    esfera.actionManager = new BABYLON.ActionManager(scene);
+    esfera.actionManager.registerAction(
+      new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnPickTrigger, () => {
+        indiceCor = (indiceCor + 1) % cores.length;
+        esfera.material.diffuseColor = cores[indiceCor];
+
+        // Feedback visual: leve "pulso" de escala ao ser selecionada
+        const escalaOriginal = esfera.scaling.clone();
+        esfera.scaling.scaleInPlace(1.25);
+        setTimeout(() => {
+          esfera.scaling.copyFrom(escalaOriginal);
+        }, 120);
+      })
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 6. WebXR: VR + AR com hit-test para reposicionar o salto
+  // ----------------------------------------------------------
+  async function configurarXR(scene, chao, esfera) {
+    try {
+      const xrHelper = await scene.createDefaultXRExperienceAsync({
+        floorMeshes: [chao],
+        uiOptions: {
+          // Tenta oferecer AR quando disponível; cai para VR por padrão
+          sessionMode: "immersive-vr"
+        },
+        optionalFeatures: true
+      });
+
+      if (!xrHelper.baseExperience) {
+        mostrarFallback();
+        return;
+      }
+
+      // Feature de hit-test para AR (reposicionar o ponto de salto)
+      const featuresManager = xrHelper.baseExperience.featuresManager;
+      let hitTest = null;
+
+      try {
+        hitTest = featuresManager.enableFeature(
+          BABYLON.WebXRHitTest.Name,
+          "latest"
+        );
+      } catch (e) {
+        console.warn("Hit-test não disponível neste dispositivo/modo:", e);
+      }
+
+      let marcadorAR = null;
+      if (hitTest) {
+        marcadorAR = BABYLON.MeshBuilder.CreateTorus(
+          "marcadorAR",
+          { diameter: 0.3, thickness: 0.02 },
+          scene
+        );
+        marcadorAR.isVisible = false;
+        marcadorAR.rotation.x = Math.PI / 2;
+
+        hitTest.onHitTestResultObservable.add((results) => {
+          if (results.length) {
+            marcadorAR.isVisible = true;
+            results[0].transformationMatrix.decompose(
+              undefined,
+              undefined,
+              marcadorAR.position
+            );
+          } else {
+            marcadorAR.isVisible = false;
+          }
+        });
+
+        // Toque na tela em modo AR reposiciona a origem do salto
+        scene.onPointerDown = (evt, pickResult) => {
+          if (marcadorAR && marcadorAR.isVisible) {
+            esfera.metadata.origem = marcadorAR.position.clone();
+            esfera.metadata.origem.y += 0.3;
+            esfera.position.copyFrom(esfera.metadata.origem);
+            esfera.metadata.reiniciarSalto();
+          }
+        };
+      }
+
+      // Atualiza indicador de status de conexão XR
+      xrHelper.baseExperience.onStateChangedObservable.add((state) => {
+        if (state === BABYLON.WebXRState.IN_XR) {
+          xrStatusEl.classList.add("connected");
+          xrStatusText.textContent = "XR conectado";
+        } else {
+          xrStatusEl.classList.remove("connected");
+          xrStatusText.textContent = "XR desconectado";
+        }
+      });
+
+      return xrHelper;
+    } catch (erro) {
+      console.warn("WebXR não suportado ou falhou ao iniciar:", erro);
+      mostrarFallback();
+      return null;
+    }
+  }
+
+  function mostrarFallback() {
+    fallbackMsg.style.display = "block";
+    xrStatusText.textContent = "XR indisponível";
+  }
+
+  // ----------------------------------------------------------
+  // 7. Verificação de suporte antes de tudo
+  // ----------------------------------------------------------
+  async function verificarSuporteXR() {
+    if (!navigator.xr) return false;
+    try {
+      const suportaVR = await navigator.xr.isSessionSupported("immersive-vr");
+      const suportaAR = await navigator.xr.isSessionSupported("immersive-ar");
+      return suportaVR || suportaAR;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Inicialização geral da aplicação
+  // ----------------------------------------------------------
+  async function iniciarAplicacao() {
+    const { engine, scene, dirLight } = criarEngineECena();
+    const chao = criarChao(scene);
+    const esfera = criarEsferaSaltitante(scene);
+
+    configurarSombras(dirLight, esfera);
+    configurarInteratividade(scene, esfera);
+
+    const suportado = await verificarSuporteXR();
+    if (suportado) {
+      await configurarXR(scene, chao, esfera);
+    } else {
+      mostrarFallback();
+    }
+
+    engine.runRenderLoop(() => {
+      scene.render();
+    });
+
+    window.addEventListener("resize", () => {
+      engine.resize();
+    });
+  }
+
+  iniciarAplicacao().catch((erro) => {
+    console.error("Erro ao iniciar a aplicação:", erro);
+    mostrarFallback();
+  });
+</script>
+
+</body>
+</html>
